@@ -280,6 +280,12 @@ public final class WinterZoneManager {
         for (ColumnPos c : paintQueue) {
             originalBiomes.put(c, world.getBiome(c.x(), sampleY, c.z()));
         }
+
+        // Snapshot natural snow/ice BEFORE forcing weather. If we detect during
+        // painting (after setStorm), vanilla may already have placed sparse
+        // snow/ice on columns not yet painted — those would be wrongly marked
+        // "preexisting" and survive /winter stop as the dotted leftovers.
+        snapshotPreexistingInPaintQueue(paintQueue);
         saveState();
 
         if (cfg.getBoolean("force-weather-on-start", true) && !world.hasStorm()) {
@@ -305,13 +311,9 @@ public final class WinterZoneManager {
     }
 
     private void processPaintBatch(Deque<ColumnPos> queue, int batchSize) {
-        int scanDepth = getMeltScanDepth();
         Set<Long> touchedChunks = new HashSet<>();
         for (int i = 0; i < batchSize && !queue.isEmpty(); i++) {
             ColumnPos c = queue.poll();
-            // Remember any snow/ice that is ALREADY here (natural terrain)
-            // before we start painting, so cleanup never removes it later.
-            detectPreexisting(c.x(), c.z(), scanDepth);
             paintColumn(c, targetBiome);
             touchedChunks.add(chunkKey(c.x() >> 4, c.z() >> 4));
         }
@@ -319,13 +321,41 @@ public final class WinterZoneManager {
     }
 
     /**
+     * Full-column preexisting snapshot for every chunk touched by the paint
+     * queue (not only every-4 biome sample columns). Must run before weather
+     * is forced so event snow/ice is never mistaken for natural terrain.
+     */
+    private void snapshotPreexistingInPaintQueue(Deque<ColumnPos> paintQueue) {
+        int scanDepth = getMeltScanDepth();
+        Set<Long> chunks = new HashSet<>();
+        for (ColumnPos c : paintQueue) {
+            chunks.add(chunkKey(c.x() >> 4, c.z() >> 4));
+        }
+        for (long key : chunks) {
+            snapshotPreexistingInChunk((int) (key >> 32), (int) key, scanDepth);
+        }
+    }
+
+    private void snapshotPreexistingInChunk(int cx, int cz, int scanDepth) {
+        int baseX = cx << 4;
+        int baseZ = cz << 4;
+        for (int lx = 0; lx < 16; lx++) {
+            for (int lz = 0; lz < 16; lz++) {
+                int x = baseX + lx;
+                int z = baseZ + lz;
+                if (!isInsideRadius(x, z, ZONE_PADDING)) continue;
+                detectPreexisting(x, z, scanDepth);
+            }
+        }
+    }
+
+    /**
      * Detect-only pass (never modifies blocks): records every snow layer
      * found in the column into {@link #preexistingSnow}, and every ICE block
      * into {@link #preexistingIce}, using the same surface-downward scan
-     * that cleanup will later use. Run once per column, right before
-     * painting/repainting it — regardless of the {@code freeze-surface-water}
-     * setting, so toggling it later never mistakes natural/foreign ice for
-     * something we're responsible for melting.
+     * that cleanup will later use. Call only for terrain that predates the
+     * event (before forcing weather, or on first load of a previously
+     * unloaded chunk that could not have received event weather ticks).
      */
     private void detectPreexisting(int x, int z, int scanDepth) {
         int top = Math.min(maxY, world.getHighestBlockYAt(x, z, HeightMap.WORLD_SURFACE));
@@ -659,6 +689,26 @@ public final class WinterZoneManager {
         int sampleY = clamp(world.getSeaLevel(), minY, maxY);
         int scanDepth = getMeltScanDepth();
 
+        // Unloaded chunks never received event weather ticks, so any snow/ice
+        // here is natural (or leftover from before). Snapshot the whole chunk
+        // once before painting — not only every-4 biome sample columns.
+        boolean anyNewColumn = false;
+        for (int x = baseX; x < baseX + 16; x += 4) {
+            for (int z = baseZ; z < baseZ + 16; z += 4) {
+                long dx = x - centerX;
+                long dz = z - centerZ;
+                if (dx * dx + dz * dz > (long) radius * (long) radius) continue;
+                if (!originalBiomes.containsKey(new ColumnPos(x, z))) {
+                    anyNewColumn = true;
+                    break;
+                }
+            }
+            if (anyNewColumn) break;
+        }
+        if (anyNewColumn) {
+            snapshotPreexistingInChunk(chunk.getX(), chunk.getZ(), scanDepth);
+        }
+
         for (int x = baseX; x < baseX + 16; x += 4) {
             for (int z = baseZ; z < baseZ + 16; z += 4) {
                 long dx = x - centerX;
@@ -668,7 +718,6 @@ public final class WinterZoneManager {
                 ColumnPos c = new ColumnPos(x, z);
                 if (originalBiomes.containsKey(c)) continue; // already painted earlier
 
-                detectPreexisting(x, z, scanDepth);
                 originalBiomes.put(c, world.getBiome(x, sampleY, z));
                 paintColumn(c, targetBiome);
             }
