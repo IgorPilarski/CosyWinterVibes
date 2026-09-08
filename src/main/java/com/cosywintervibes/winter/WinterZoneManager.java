@@ -89,6 +89,10 @@ public final class WinterZoneManager {
         this.stateFile = new File(plugin.getDataFolder(), "winter-state.yml");
     }
 
+    public org.bukkit.plugin.java.JavaPlugin getPlugin() {
+        return plugin;
+    }
+
     // =================================================================
     //  Public API used by the command and listener
     // =================================================================

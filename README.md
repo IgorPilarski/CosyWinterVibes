@@ -32,10 +32,12 @@ Output: `target/CosyWinterVibes.jar` — copy it into your server's `plugins/` f
 | Command | Description |
 |---------|-------------|
 | `/winter setcenter <radius>` | Sets the zone center to your position and radius |
+| `/winter setcenter <radius> <x> <z>` | Sets the zone center to explicit coordinates (world = your world, or configured/default from console) |
 | `/winter start` | Starts the winter event |
 | `/winter stop` | Stops winter, restores biomes, cleans snow |
 | `/winter status` | Shows whether winter is active |
 | `/winter cleanup` | Cleans leftover snow / white grass without starting winter |
+| `/winter help` | Shows command help |
 
 Permission: `cosywintervibes.admin` (default: OP)
 
