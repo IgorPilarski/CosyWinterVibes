@@ -9,7 +9,7 @@ website: https://github.com/IgorPilarski/CosyWinterVibes
 commands:
   winter:
     description: Manage the CosyWinterVibes winter event.
-    usage: /winter <start|stop|status|setcenter|cleanup|help>
+    usage: /winter <start|stop|status|setcenter|cleanup|freeze|help>
     permission: cosywintervibes.admin
 
 permissions:

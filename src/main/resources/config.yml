@@ -47,3 +47,18 @@ melting:
 # in the zone before capping new layers (so snow does not grow into a full
 # block and hinder walking/farms).
 max-snow-layers: 3
+
+# OPTIONAL, DEFAULT DISABLED. When false (default), ALL ice (ICE and
+# FROSTED_ICE) is cancelled inside the zone — identical to previous versions,
+# safest choice for farms.
+#
+# When true, vanilla ICE is allowed to form, but ONLY on truly open surface
+# water (sky exposure): the block above the water is AIR AND
+# getLightFromSky() > 0. Water hidden under any block (a roof, a farm's
+# collection system, etc.) never freezes. FROSTED_ICE (Frost Walker) is
+# ALWAYS cancelled regardless of this setting — we don't want that mechanic.
+#
+# Tip: to farm-proof water when this is enabled, cover it with a bottom slab
+# (e.g. minecraft:stone_slab, bottom half) — it blocks direct sky exposure
+# without blocking water flow into hoppers/collectors below.
+freeze-surface-water: false
