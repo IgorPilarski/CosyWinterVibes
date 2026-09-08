@@ -1,0 +1,18 @@
+name: CosyWinterVibes
+version: ${project.version}
+main: com.cosywintervibes.CosyWinterVibes
+api-version: '1.21'
+description: Temporary reversible winter event inside a configurable base zone.
+author: IgorPilarski
+website: https://github.com/IgorPilarski/CosyWinterVibes
+
+commands:
+  winter:
+    description: Manage the CosyWinterVibes winter event.
+    usage: /winter <start|stop|status|setcenter|cleanup>
+    permission: cosywintervibes.admin
+
+permissions:
+  cosywintervibes.admin:
+    description: Allows managing the winter event.
+    default: op

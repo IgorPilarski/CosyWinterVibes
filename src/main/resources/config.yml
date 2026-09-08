@@ -1,0 +1,47 @@
+# =====================================================================
+#  CosyWinterVibes - winter event zone configuration
+# =====================================================================
+
+zone:
+  # World that contains the base. Leave empty ("") and set it with
+  # "/winter setcenter <radius>" (uses the player's world).
+  world: ""
+  center-x: 0
+  center-z: 0
+  radius: 80
+
+  # Height range for biome painting. -1 = auto-detect world limits
+  # (World#getMinHeight / getMaxHeight). Narrowing this range (e.g. only
+  # around base level) greatly speeds up painting/restoring the zone.
+  min-y: -1
+  max-y: -1
+
+  # Target winter biome (namespaced key). Sensible options:
+  # minecraft:snowy_taiga, minecraft:snowy_plains, minecraft:grove
+  target-biome: "minecraft:snowy_taiga"
+
+# Whether to force weather (rain/snow) in the ENTIRE world on event start,
+# so the effect is visible immediately instead of waiting for natural rain.
+# NOTE: this setting is global for the world (affects weather outside the
+# zone too); the biome itself only changes inside the zone.
+force-weather-on-start: true
+
+# Performance settings for biome painting/restoring (one-shot operation
+# at start/stop, spread over time to avoid a single TPS spike).
+painting:
+  columns-per-batch: 40
+  ticks-between-batches: 2
+
+# Snow cleanup settings after /winter stop or /winter cleanup.
+# Scan walks CHUNKS from the surface downward (scan-depth), not the full world height.
+melting:
+  blocks-per-batch: 800
+  ticks-between-batches: 1
+  chunks-per-tick: 3
+  # How many blocks downward from the surface to check (tree leaves, roofs).
+  scan-depth: 128
+
+# Maximum snow layer level (1-8) that the plugin allows to form naturally
+# in the zone before capping new layers (so snow does not grow into a full
+# block and hinder walking/farms).
+max-snow-layers: 3
