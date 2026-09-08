@@ -111,6 +111,22 @@ public final class WinterZoneManager {
     private BukkitTask paintTask;
     private BukkitTask restoreTask;
     private BukkitTask meltTask;
+    /** Whether the current melt/sweep should spare preexisting snow/ice. */
+    private boolean meltRespectPreexisting = true;
+    /**
+     * Biome restoration (restoreTask) and snow/ice melt (meltTask) run as two
+     * INDEPENDENT scheduled tasks during "/winter stop", at very different
+     * speeds (restoring a huge radius paints far fewer columns per tick than
+     * the melt sweep processes chunks). If {@code cleaningUp} dropped to
+     * false as soon as melt finished — while restore was still repainting
+     * far-away columns back to the winter biome — vanilla weather could
+     * freely re-snow those still-winter, still-loaded (player nearby) chunks
+     * with NOTHING left to cancel or track it (neither active nor cleaningUp
+     * anymore). These two flags gate the actual "cleanup finished" reset
+     * ({@link #tryFinishCleanup()}) until BOTH tasks are done.
+     */
+    private boolean restorePending = false;
+    private boolean meltPending = false;
 
     public WinterZoneManager(org.bukkit.plugin.java.JavaPlugin plugin) {
         this.plugin = plugin;
@@ -350,21 +366,27 @@ public final class WinterZoneManager {
     }
 
     /**
-     * Detect-only pass (never modifies blocks): records every snow layer
-     * found in the column into {@link #preexistingSnow}, and every ICE block
-     * into {@link #preexistingIce}, using the same surface-downward scan
-     * that cleanup will later use. Call only for terrain that predates the
-     * event (before forcing weather, or on first load of a previously
-     * unloaded chunk that could not have received event weather ticks).
+     * Detect-only pass (never modifies blocks): records snow/ICE that looks
+     * like natural cold-biome terrain into the preexisting sets.
+     * <p>
+     * Only positions in a cold column (vanilla snow threshold: temperature
+     * &lt; 0.15) are protected. Leftover snow/ice from a previous event sitting
+     * on plains/forests must NOT be marked preexisting — otherwise the next
+     * /winter stop would "clean only the edges" (fresh snow) and leave the
+     * old dotted interior untouched.
      */
     private void detectPreexisting(int x, int z, int scanDepth) {
         int top = Math.min(maxY, world.getHighestBlockYAt(x, z, HeightMap.WORLD_SURFACE));
         int bottom = Math.max(minY, top - scanDepth);
         for (int y = top; y >= bottom; y--) {
-            Material type = world.getBlockAt(x, y, z).getType();
+            Block block = world.getBlockAt(x, y, z);
+            Material type = block.getType();
+            if (type != Material.SNOW && type != Material.ICE) continue;
+            // Hot/warm biomes never keep natural snow/ice — treat as leftover.
+            if (block.getTemperature() >= 0.15f) continue;
             if (type == Material.SNOW) {
                 preexistingSnow.add(new SnowPos(x, y, z));
-            } else if (type == Material.ICE) {
+            } else {
                 preexistingIce.add(new SnowPos(x, y, z));
             }
         }
@@ -417,6 +439,11 @@ public final class WinterZoneManager {
         int columnsPerBatch = getPaintColumnsPerBatch();
         long ticksBetween = getPaintTicksBetweenBatches();
 
+        // See the restorePending/meltPending field comment: the zone must stay
+        // in "cleaningUp" (new snow/ice cancelled) until BOTH the biome
+        // restore and the melt/sweep are done, not just whichever finishes first.
+        restorePending = !restoreQueue.isEmpty();
+
         restoreTask = Bukkit.getScheduler().runTaskTimer(plugin, () -> {
             Set<Long> touchedChunks = new HashSet<>();
             for (int i = 0; i < columnsPerBatch && !restoreQueue.isEmpty(); i++) {
@@ -431,19 +458,24 @@ public final class WinterZoneManager {
             if (restoreQueue.isEmpty()) {
                 cancel(restoreTask);
                 restoreTask = null;
+                restorePending = false;
                 saveState();
+                tryFinishCleanup();
             }
         }, 0L, ticksBetween);
 
-        startMeltAndSweep(cfg);
+        startMeltAndSweep(cfg, true);
 
         sender.sendMessage("§bWinter is ending — biome returns to normal, snow and white grass will be cleaned up in the background.");
     }
 
     /**
      * Fixes leftovers after an already finished winter (or older-version bugs):
-     * removes snow layers in the zone and clears the snowy flag on grass.
+     * removes snow layers and ice in the zone and clears the snowy flag on grass.
      * Does not require an active event — reads center/radius from config.yml.
+     * <p>
+     * Unlike /winter stop, this deliberately ignores preexisting protection:
+     * the whole point is to wipe leftover dotted snow/ice from a bad run.
      */
     public void cleanup(CommandSender sender) {
         if (active) {
@@ -461,10 +493,17 @@ public final class WinterZoneManager {
         meltTask = null;
         trackedSnow.clear();
         trackedIce.clear();
+        // Drop any stale preexisting marks (e.g. leftover dots wrongly saved
+        // as "natural" by an older build) so the sweep actually removes them.
+        preexistingSnow.clear();
+        preexistingIce.clear();
         cleaningUp = true;
+        // /winter cleanup never touches biomes, so there is no restore task
+        // to wait for — only the melt/sweep gates the "cleaningUp" reset.
+        restorePending = false;
         saveState();
-        startMeltAndSweep(plugin.getConfig());
-        sender.sendMessage("§bCleaning remaining snow and white grass in the zone...");
+        startMeltAndSweep(plugin.getConfig(), false);
+        sender.sendMessage("§bCleaning remaining snow, ice and white grass in the zone...");
     }
 
     /**
@@ -473,8 +512,14 @@ public final class WinterZoneManager {
      *     (no layer-by-layer melt),
      *  2) scan the zone by CHUNKS (memory locality + fewer tickets at once),
      *  3) in each column only look downward from the surface (not full world height).
+     *
+     * @param respectPreexisting when true ( /winter stop ), natural cold-biome
+     *                           snow/ice is left alone; when false ( /winter cleanup ),
+     *                           every snow/ICE block in the zone is removed.
      */
-    private void startMeltAndSweep(org.bukkit.configuration.file.FileConfiguration cfg) {
+    private void startMeltAndSweep(org.bukkit.configuration.file.FileConfiguration cfg, boolean respectPreexisting) {
+        this.meltRespectPreexisting = respectPreexisting;
+        this.meltPending = true;
         int blocksPerBatch = Math.max(50, cfg.getInt("melting.blocks-per-batch", 800));
         long ticksBetween = Math.max(1, cfg.getInt("melting.ticks-between-batches", 1));
         int chunksPerTick = Math.max(1, cfg.getInt("melting.chunks-per-tick", 3));
@@ -484,12 +529,13 @@ public final class WinterZoneManager {
         Deque<SnowPos> trackedIceQueue = new ArrayDeque<>(trackedIce);
         Deque<Long> chunkQueue = new ArrayDeque<>();
         final boolean[] chunksPrepared = {false};
+        final boolean respect = respectPreexisting;
 
         meltTask = Bukkit.getScheduler().runTaskTimer(plugin, () -> {
             // Phase 1: instantly remove what we tracked ourselves.
             if (!trackedQueue.isEmpty()) {
                 for (int i = 0; i < blocksPerBatch && !trackedQueue.isEmpty(); i++) {
-                    removeSnowFully(trackedQueue.poll());
+                    removeSnowFully(trackedQueue.poll(), respect);
                 }
                 if (trackedQueue.isEmpty()) {
                     trackedSnow.clear();
@@ -500,7 +546,7 @@ public final class WinterZoneManager {
             // Phase 2: instantly melt tracked ice back to water.
             if (!trackedIceQueue.isEmpty()) {
                 for (int i = 0; i < blocksPerBatch && !trackedIceQueue.isEmpty(); i++) {
-                    meltIceFully(trackedIceQueue.poll());
+                    meltIceFully(trackedIceQueue.poll(), respect);
                 }
                 if (trackedIceQueue.isEmpty()) {
                     trackedIce.clear();
@@ -513,7 +559,7 @@ public final class WinterZoneManager {
                 chunksPrepared[0] = true;
                 plugin.getLogger().info("Cleanup: scanning " + chunkQueue.size() + " chunks (depth " + scanDepth + ").");
                 if (chunkQueue.isEmpty()) {
-                    finishMelt();
+                    onMeltDone();
                 }
                 return;
             }
@@ -530,23 +576,39 @@ public final class WinterZoneManager {
                 if (!world.isChunkGenerated(cx, cz)) continue;
                 world.addPluginChunkTicket(cx, cz, plugin);
                 world.getChunkAt(cx, cz);
-                sweepChunk(cx, cz, scanDepth);
+                sweepChunk(cx, cz, scanDepth, respect);
                 world.removePluginChunkTicket(cx, cz, plugin);
             }
 
             if (chunkQueue.isEmpty()) {
-                finishMelt();
+                onMeltDone();
             }
         }, 0L, ticksBetween);
     }
 
-    private void finishMelt() {
+    /** Melt/sweep phase finished — clears its own state, then tries to close out cleanup. */
+    private void onMeltDone() {
         cancel(meltTask);
         meltTask = null;
         trackedSnow.clear();
         preexistingSnow.clear();
         trackedIce.clear();
         preexistingIce.clear();
+        meltPending = false;
+        tryFinishCleanup();
+    }
+
+    /**
+     * Only actually ends "cleaningUp" (re-enabling normal vanilla snow/ice
+     * everywhere, since nothing cancels it inside the zone anymore) once
+     * BOTH the biome restore and the melt/sweep have finished. See the
+     * restorePending/meltPending field comment for why this matters — ending
+     * it early left still-not-restored, still-loaded chunks free to re-snow
+     * with nothing tracking or cancelling it.
+     */
+    private void tryFinishCleanup() {
+        if (restorePending || meltPending) return;
+        if (!cleaningUp) return; // already finished (or never started) — avoid a double broadcast
         cleaningUp = false;
         releaseChunkTickets();
         saveState();
@@ -554,11 +616,11 @@ public final class WinterZoneManager {
     }
 
     /** Removes the entire snow layer at once and fixes snowy below. */
-    private void removeSnowFully(SnowPos p) {
+    private void removeSnowFully(SnowPos p, boolean respectPreexisting) {
         // Never remove snow that was already there before winter started —
         // even if vanilla weather grew an extra layer on top of it during
         // the event (which is what put it in the tracked-snow queue).
-        if (preexistingSnow.contains(p)) return;
+        if (respectPreexisting && preexistingSnow.contains(p)) return;
         Block block = world.getBlockAt(p.x(), p.y(), p.z());
         if (block.getType() == Material.SNOW) {
             block.setType(Material.AIR, false);
@@ -567,10 +629,10 @@ public final class WinterZoneManager {
     }
 
     /** Melts a single tracked ICE block back to a water source. */
-    private void meltIceFully(SnowPos p) {
+    private void meltIceFully(SnowPos p, boolean respectPreexisting) {
         // Never melt ice that was already there before winter started
         // (a naturally frozen river/lake) — mirrors removeSnowFully().
-        if (preexistingIce.contains(p)) return;
+        if (respectPreexisting && preexistingIce.contains(p)) return;
         Block block = world.getBlockAt(p.x(), p.y(), p.z());
         if (block.getType() == Material.ICE) {
             block.setType(Material.WATER, false);
@@ -617,7 +679,7 @@ public final class WinterZoneManager {
         return dx * dx + dz * dz <= (long) sweepRadius * (long) sweepRadius;
     }
 
-    private void sweepChunk(int cx, int cz, int scanDepth) {
+    private void sweepChunk(int cx, int cz, int scanDepth, boolean respectPreexisting) {
         int baseX = cx << 4;
         int baseZ = cz << 4;
         for (int lx = 0; lx < 16; lx++) {
@@ -625,7 +687,7 @@ public final class WinterZoneManager {
                 int x = baseX + lx;
                 int z = baseZ + lz;
                 if (!isInsideRadius(x, z, ZONE_PADDING)) continue;
-                sweepColumn(x, z, scanDepth);
+                sweepColumn(x, z, scanDepth, respectPreexisting);
             }
         }
     }
@@ -634,7 +696,7 @@ public final class WinterZoneManager {
      * Scans a column from the surface (HeightMap.WORLD_SURFACE) downward by scanDepth.
      * Enough for snow on ground, roofs and leaves — without walking the full world Y.
      */
-    private void sweepColumn(int x, int z, int scanDepth) {
+    private void sweepColumn(int x, int z, int scanDepth, boolean respectPreexisting) {
         int top = Math.min(maxY, world.getHighestBlockYAt(x, z, HeightMap.WORLD_SURFACE));
         int bottom = Math.max(minY, top - scanDepth);
         for (int y = top; y >= bottom; y--) {
@@ -643,8 +705,9 @@ public final class WinterZoneManager {
 
             if (type == Material.SNOW) {
                 // Natural snow that predates the event (mountains, an
-                // existing snowy biome, ...) is left exactly as it was.
-                if (!preexistingSnow.contains(new SnowPos(x, y, z))) {
+                // existing snowy biome, ...) is left exactly as it was —
+                // unless this is an aggressive /winter cleanup.
+                if (!respectPreexisting || !preexistingSnow.contains(new SnowPos(x, y, z))) {
                     block.setType(Material.AIR, false);
                     clearSnowyBelow(block);
                 }
@@ -654,8 +717,9 @@ public final class WinterZoneManager {
             if (type == Material.ICE) {
                 // Safety-net sweep for ice that vanilla formed but we never
                 // tracked (e.g. state loss across a crash). Never touches
-                // ice that predates the event (frozen river/lake, etc.).
-                if (!preexistingIce.contains(new SnowPos(x, y, z))) {
+                // ice that predates the event (frozen river/lake, etc.)
+                // unless this is an aggressive /winter cleanup.
+                if (!respectPreexisting || !preexistingIce.contains(new SnowPos(x, y, z))) {
                     block.setType(Material.WATER, false);
                 }
                 continue;
@@ -679,7 +743,7 @@ public final class WinterZoneManager {
     /** Called by the listener on ChunkLoadEvent. */
     public void onChunkLoaded(Chunk chunk) {
         if (cleaningUp && world != null && chunk.getWorld().equals(world)) {
-            sweepChunk(chunk.getX(), chunk.getZ(), getMeltScanDepth());
+            sweepChunk(chunk.getX(), chunk.getZ(), getMeltScanDepth(), meltRespectPreexisting);
         }
 
         if (!active || world == null || !chunk.getWorld().equals(world)) return;
@@ -795,6 +859,7 @@ public final class WinterZoneManager {
             plugin.getLogger().info("Incomplete post-winter cleanup detected — finishing in the background.");
             var cfg = plugin.getConfig();
             cleaningUp = true;
+            restorePending = !originalBiomes.isEmpty();
             if (!originalBiomes.isEmpty()) {
                 Deque<ColumnPos> restoreQueue = new ArrayDeque<>(originalBiomes.keySet());
                 int columnsPerBatch = getPaintColumnsPerBatch();
@@ -813,11 +878,13 @@ public final class WinterZoneManager {
                     if (restoreQueue.isEmpty()) {
                         cancel(restoreTask);
                         restoreTask = null;
+                        restorePending = false;
                         saveState();
+                        tryFinishCleanup();
                     }
                 }, 20L, ticksBetween);
             }
-            startMeltAndSweep(cfg);
+            startMeltAndSweep(cfg, true);
         }
     }
 

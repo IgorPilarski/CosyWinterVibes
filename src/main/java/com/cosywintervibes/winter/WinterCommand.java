@@ -160,7 +160,7 @@ public final class WinterCommand implements CommandExecutor, TabCompleter {
         sender.sendMessage("§e/" + label + " start§7 - start the winter event");
         sender.sendMessage("§e/" + label + " stop§7 - stop winter, restore biomes, clean snow");
         sender.sendMessage("§e/" + label + " status§7 - show whether winter is active");
-        sender.sendMessage("§e/" + label + " cleanup§7 - clean leftover snow / white grass");
+        sender.sendMessage("§e/" + label + " cleanup§7 - wipe leftover snow/ice in the zone (ignores preexisting protection)");
         sender.sendMessage("§e/" + label + " freeze [on|off]§7 - allow ice on open surface water (omit arg to show)");
         sender.sendMessage("§e/" + label + " help§7 - show this help");
         sender.sendMessage("§aExample: /" + label + " setcenter 80");
