@@ -13,6 +13,8 @@ zone:
   # Height range for biome painting. -1 = auto-detect world limits
   # (World#getMinHeight / getMaxHeight). Narrowing this range (e.g. only
   # around base level) greatly speeds up painting/restoring the zone.
+  # NOTE: -1 is reserved as the "auto" sentinel — if you ever need the zone
+  # floor/ceiling to be an EXACT Y of -1, use a different value (e.g. -2).
   min-y: -1
   max-y: -1
 

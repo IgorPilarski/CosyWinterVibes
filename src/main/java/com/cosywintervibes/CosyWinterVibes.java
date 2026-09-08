@@ -26,9 +26,17 @@ public final class CosyWinterVibes extends JavaPlugin {
 
         getServer().getPluginManager().registerEvents(new WinterWeatherListener(zoneManager), this);
 
+        var winterCommand = getCommand("winter");
+        if (winterCommand == null) {
+            // Should only happen if plugin.yml is missing/broken — fail loudly
+            // instead of crashing onEnable() with a NullPointerException.
+            getLogger().severe("Command 'winter' is not defined in plugin.yml — disabling plugin.");
+            getServer().getPluginManager().disablePlugin(this);
+            return;
+        }
         WinterCommand command = new WinterCommand(zoneManager);
-        getCommand("winter").setExecutor(command);
-        getCommand("winter").setTabCompleter(command);
+        winterCommand.setExecutor(command);
+        winterCommand.setTabCompleter(command);
 
         getLogger().info("CosyWinterVibes enabled. Winter active: " + zoneManager.isActive());
     }

@@ -25,11 +25,10 @@
         <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
         <maven.compiler.release>21</maven.compiler.release>
         <!--
-            Paper API version MUST match your server's Minecraft version.
-            If your server runs 1.20.x, change to e.g. 1.20.6-R0.1-SNAPSHOT
-            and set maven.compiler.release to 17 (1.20.x needs Java 17, not 21).
+            Open-ended version range: always resolves to the latest available
+            Paper 26.2 build, matching the other IgorPilarski plugins.
         -->
-        <paper.version>1.21.4-R0.1-SNAPSHOT</paper.version>
+        <paper.version>[26.2.build,)</paper.version>
     </properties>
 
     <repositories>

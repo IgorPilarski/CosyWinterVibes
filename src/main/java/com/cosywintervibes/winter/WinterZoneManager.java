@@ -37,6 +37,9 @@ import java.util.logging.Level;
  *    during the event loses nothing,
  *  - tracking snow blocks that vanilla weather formed inside the zone
  *    (see WinterWeatherListener), so "/winter stop" cleans up ONLY what we caused,
+ *  - remembering snow that was ALREADY there before the event (natural
+ *    mountains / an existing snowy biome inside the zone) so cleanup never
+ *    touches it,
  *  - melting snow and restoring the original biome.
  *
  * We deliberately only touch the world through public Bukkit/Paper API
@@ -49,8 +52,10 @@ public final class WinterZoneManager {
      * Minecraft stores biomes in 4x4x4 cells. We paint columns every 4 blocks,
      * so a winter cell always slightly overhangs the zone circle.
      * Padding of 8 covers that overflow with margin.
+     * Public so {@link WinterWeatherListener} uses the exact same value —
+     * keeping two separate copies in sync by hand is a bug waiting to happen.
      */
-    private static final int BIOME_CELL_PADDING = 8;
+    public static final int ZONE_PADDING = 8;
 
     /** Terrain column (biome is 3D; we set it for the full column height at once). */
     record ColumnPos(int x, int z) {}
@@ -79,6 +84,14 @@ public final class WinterZoneManager {
 
     private final Map<ColumnPos, Biome> originalBiomes = new HashMap<>();
     private final Set<SnowPos> trackedSnow = new HashSet<>();
+    /**
+     * Snow layers that were already sitting in the zone BEFORE "/winter start"
+     * (natural terrain — mountains, an existing snowy biome, etc.). Detected
+     * once at start and never touched again: cleanup only removes snow that
+     * is NOT in this set, so pre-existing natural snow always survives the
+     * whole start -> stop -> cleanup cycle untouched.
+     */
+    private final Set<SnowPos> preexistingSnow = new HashSet<>();
 
     private BukkitTask paintTask;
     private BukkitTask restoreTask;
@@ -190,25 +203,29 @@ public final class WinterZoneManager {
             return;
         }
 
-        this.world = resolvedWorld;
-        this.centerX = cfg.getInt("zone.center-x", 0);
-        this.centerZ = cfg.getInt("zone.center-z", 0);
-        this.radius = Math.max(4, cfg.getInt("zone.radius", 80));
-        int cfgMinY = cfg.getInt("zone.min-y", -1);
-        int cfgMaxY = cfg.getInt("zone.max-y", -1);
-        this.minY = cfgMinY == -1 ? world.getMinHeight() : cfgMinY;
-        this.maxY = cfgMaxY == -1 ? world.getMaxHeight() - 1 : cfgMaxY;
+        applyZoneBoundsFromConfig(resolvedWorld);
         this.targetBiome = resolvedBiome;
 
         this.originalBiomes.clear();
         this.trackedSnow.clear();
+        this.preexistingSnow.clear();
         this.active = true;
 
         Deque<ColumnPos> paintQueue = new ArrayDeque<>();
         collectColumnsInZone(paintQueue);
 
-        // Snapshot ORIGINAL biomes 100% BEFORE any change and save to disk
-        // before painting starts — safety net if the server crashes mid-operation.
+        // Snapshot ORIGINAL biomes BEFORE any change and save to disk before
+        // painting starts — safety net if the server crashes mid-operation.
+        // NOTE: we only sample ONE Y (sea level) per column, not per 4-block
+        // cell like painting does. This is intentional: the whole point of
+        // this plugin is a cosmetic SURFACE effect (snow), so restoring the
+        // surface biome is what matters. A side effect is that if a column
+        // has a different biome underground (e.g. a lush cave / dripstone
+        // cave under the base), "/winter stop" will overwrite that
+        // underground biome with the surface one too, instead of restoring
+        // it exactly. Fixing that would require snapshotting every 4-block Y
+        // cell instead of one sample per column (much bigger state file) —
+        // not done here since it doesn't affect the actual snow feature.
         int sampleY = clamp(world.getSeaLevel(), minY, maxY);
         for (ColumnPos c : paintQueue) {
             originalBiomes.put(c, world.getBiome(c.x(), sampleY, c.z()));
@@ -221,8 +238,8 @@ public final class WinterZoneManager {
             weatherForcedByUs = true;
         }
 
-        int columnsPerBatch = Math.max(1, cfg.getInt("painting.columns-per-batch", 40));
-        long ticksBetween = Math.max(1, cfg.getInt("painting.ticks-between-batches", 2));
+        int columnsPerBatch = getPaintColumnsPerBatch();
+        long ticksBetween = getPaintTicksBetweenBatches();
 
         sender.sendMessage("§bWinter is starting — painting " + paintQueue.size() + " terrain columns in the background...");
 
@@ -238,19 +255,54 @@ public final class WinterZoneManager {
     }
 
     private void processPaintBatch(Deque<ColumnPos> queue, int batchSize) {
+        int scanDepth = getMeltScanDepth();
         Set<Long> touchedChunks = new HashSet<>();
         for (int i = 0; i < batchSize && !queue.isEmpty(); i++) {
             ColumnPos c = queue.poll();
+            // Remember any snow that is ALREADY here (natural terrain) before
+            // we start painting, so cleanup never removes it later.
+            detectPreexistingSnow(c.x(), c.z(), scanDepth);
             paintColumn(c, targetBiome);
             touchedChunks.add(chunkKey(c.x() >> 4, c.z() >> 4));
         }
         refreshChunks(touchedChunks);
     }
 
+    /**
+     * Detect-only pass (never modifies blocks): records every snow layer
+     * found in the column into {@link #preexistingSnow}, using the same
+     * surface-downward scan that cleanup will later use. Run once per
+     * column, right before painting/repainting it.
+     */
+    private void detectPreexistingSnow(int x, int z, int scanDepth) {
+        int top = Math.min(maxY, world.getHighestBlockYAt(x, z, HeightMap.WORLD_SURFACE));
+        int bottom = Math.max(minY, top - scanDepth);
+        for (int y = top; y >= bottom; y--) {
+            if (world.getBlockAt(x, y, z).getType() == Material.SNOW) {
+                preexistingSnow.add(new SnowPos(x, y, z));
+            }
+        }
+    }
+
     private void paintColumn(ColumnPos c, Biome biome) {
         for (int y = minY; y <= maxY; y += 4) {
             world.setBiome(c.x(), y, c.z(), biome);
         }
+    }
+
+    // Shared config readers for painting/restoring — used by start(), stop(),
+    // loadPersistedState() and resumeAfterRestart() so the defaults live in
+    // exactly one place.
+    private int getPaintColumnsPerBatch() {
+        return Math.max(1, plugin.getConfig().getInt("painting.columns-per-batch", 40));
+    }
+
+    private long getPaintTicksBetweenBatches() {
+        return Math.max(1, plugin.getConfig().getInt("painting.ticks-between-batches", 2));
+    }
+
+    private int getMeltScanDepth() {
+        return Math.max(32, plugin.getConfig().getInt("melting.scan-depth", 128));
     }
 
     // =================================================================
@@ -276,8 +328,8 @@ public final class WinterZoneManager {
         saveState();
 
         Deque<ColumnPos> restoreQueue = new ArrayDeque<>(originalBiomes.keySet());
-        int columnsPerBatch = Math.max(1, cfg.getInt("painting.columns-per-batch", 40));
-        long ticksBetween = Math.max(1, cfg.getInt("painting.ticks-between-batches", 2));
+        int columnsPerBatch = getPaintColumnsPerBatch();
+        long ticksBetween = getPaintTicksBetweenBatches();
 
         restoreTask = Bukkit.getScheduler().runTaskTimer(plugin, () -> {
             Set<Long> touchedChunks = new HashSet<>();
@@ -312,6 +364,10 @@ public final class WinterZoneManager {
             sender.sendMessage("§cWinter is active. Use /winter stop — it cleans up by itself.");
             return;
         }
+        if (cleaningUp) {
+            sender.sendMessage("§eA cleanup is already running. Wait for it to finish.");
+            return;
+        }
         if (!resolveZoneFromConfig(sender)) {
             return;
         }
@@ -334,7 +390,7 @@ public final class WinterZoneManager {
         int blocksPerBatch = Math.max(50, cfg.getInt("melting.blocks-per-batch", 800));
         long ticksBetween = Math.max(1, cfg.getInt("melting.ticks-between-batches", 1));
         int chunksPerTick = Math.max(1, cfg.getInt("melting.chunks-per-tick", 3));
-        int scanDepth = Math.max(32, cfg.getInt("melting.scan-depth", 128));
+        int scanDepth = getMeltScanDepth();
 
         Deque<SnowPos> trackedQueue = new ArrayDeque<>(trackedSnow);
         Deque<Long> chunkQueue = new ArrayDeque<>();
@@ -366,6 +422,12 @@ public final class WinterZoneManager {
                 long key = chunkQueue.poll();
                 int cx = (int) (key >> 32);
                 int cz = (int) key;
+                // A chunk that was never generated cannot contain any snow we
+                // (or vanilla) ever placed there. Skip it instead of calling
+                // getChunkAt(), which would otherwise SYNCHRONOUSLY GENERATE
+                // brand-new terrain on the main thread just to scan it — a
+                // needless lag spike, and it would permanently expand the map.
+                if (!world.isChunkGenerated(cx, cz)) continue;
                 world.addPluginChunkTicket(cx, cz, plugin);
                 world.getChunkAt(cx, cz);
                 sweepChunk(cx, cz, scanDepth);
@@ -382,6 +444,7 @@ public final class WinterZoneManager {
         cancel(meltTask);
         meltTask = null;
         trackedSnow.clear();
+        preexistingSnow.clear();
         cleaningUp = false;
         releaseChunkTickets();
         saveState();
@@ -390,6 +453,10 @@ public final class WinterZoneManager {
 
     /** Removes the entire snow layer at once and fixes snowy below. */
     private void removeSnowFully(SnowPos p) {
+        // Never remove snow that was already there before winter started —
+        // even if vanilla weather grew an extra layer on top of it during
+        // the event (which is what put it in the tracked-snow queue).
+        if (preexistingSnow.contains(p)) return;
         Block block = world.getBlockAt(p.x(), p.y(), p.z());
         if (block.getType() == Material.SNOW) {
             block.setType(Material.AIR, false);
@@ -410,7 +477,7 @@ public final class WinterZoneManager {
     /** Queue of chunks intersecting the zone (+ padding) — without loading them upfront. */
     private void collectSweepChunks(Deque<Long> out) {
         if (world == null) return;
-        int sweepRadius = radius + BIOME_CELL_PADDING;
+        int sweepRadius = radius + ZONE_PADDING;
         int minCx = (centerX - sweepRadius) >> 4;
         int maxCx = (centerX + sweepRadius) >> 4;
         int minCz = (centerZ - sweepRadius) >> 4;
@@ -444,7 +511,7 @@ public final class WinterZoneManager {
             for (int lz = 0; lz < 16; lz++) {
                 int x = baseX + lx;
                 int z = baseZ + lz;
-                if (!isInsideRadius(x, z, BIOME_CELL_PADDING)) continue;
+                if (!isInsideRadius(x, z, ZONE_PADDING)) continue;
                 sweepColumn(x, z, scanDepth);
             }
         }
@@ -462,8 +529,12 @@ public final class WinterZoneManager {
             Material type = block.getType();
 
             if (type == Material.SNOW) {
-                block.setType(Material.AIR, false);
-                clearSnowyBelow(block);
+                // Natural snow that predates the event (mountains, an
+                // existing snowy biome, ...) is left exactly as it was.
+                if (!preexistingSnow.contains(new SnowPos(x, y, z))) {
+                    block.setType(Material.AIR, false);
+                    clearSnowyBelow(block);
+                }
                 continue;
             }
 
@@ -485,8 +556,7 @@ public final class WinterZoneManager {
     /** Called by the listener on ChunkLoadEvent. */
     public void onChunkLoaded(Chunk chunk) {
         if (cleaningUp && world != null && chunk.getWorld().equals(world)) {
-            int scanDepth = Math.max(32, plugin.getConfig().getInt("melting.scan-depth", 128));
-            sweepChunk(chunk.getX(), chunk.getZ(), scanDepth);
+            sweepChunk(chunk.getX(), chunk.getZ(), getMeltScanDepth());
         }
 
         if (!active || world == null || !chunk.getWorld().equals(world)) return;
@@ -494,6 +564,7 @@ public final class WinterZoneManager {
         int baseX = chunk.getX() << 4;
         int baseZ = chunk.getZ() << 4;
         int sampleY = clamp(world.getSeaLevel(), minY, maxY);
+        int scanDepth = getMeltScanDepth();
 
         for (int x = baseX; x < baseX + 16; x += 4) {
             for (int z = baseZ; z < baseZ + 16; z += 4) {
@@ -504,6 +575,7 @@ public final class WinterZoneManager {
                 ColumnPos c = new ColumnPos(x, z);
                 if (originalBiomes.containsKey(c)) continue; // already painted earlier
 
+                detectPreexistingSnow(x, z, scanDepth);
                 originalBiomes.put(c, world.getBiome(x, sampleY, z));
                 paintColumn(c, targetBiome);
             }
@@ -556,6 +628,12 @@ public final class WinterZoneManager {
             trackedSnow.add(new SnowPos(Integer.parseInt(parts[0]), Integer.parseInt(parts[1]), Integer.parseInt(parts[2])));
         }
 
+        preexistingSnow.clear();
+        for (String entry : yaml.getStringList("preexisting-snow-blocks")) {
+            String[] parts = entry.split(",");
+            preexistingSnow.add(new SnowPos(Integer.parseInt(parts[0]), Integer.parseInt(parts[1]), Integer.parseInt(parts[2])));
+        }
+
         if (active) {
             plugin.getLogger().info("Interrupted winter event detected — resuming painting/cleanup in the background.");
             resumeAfterRestart();
@@ -565,8 +643,8 @@ public final class WinterZoneManager {
             cleaningUp = true;
             if (!originalBiomes.isEmpty()) {
                 Deque<ColumnPos> restoreQueue = new ArrayDeque<>(originalBiomes.keySet());
-                int columnsPerBatch = Math.max(1, cfg.getInt("painting.columns-per-batch", 40));
-                long ticksBetween = Math.max(1, cfg.getInt("painting.ticks-between-batches", 2));
+                int columnsPerBatch = getPaintColumnsPerBatch();
+                long ticksBetween = getPaintTicksBetweenBatches();
                 restoreTask = Bukkit.getScheduler().runTaskTimer(plugin, () -> {
                     Set<Long> touchedChunks = new HashSet<>();
                     for (int i = 0; i < columnsPerBatch && !restoreQueue.isEmpty(); i++) {
@@ -601,9 +679,8 @@ public final class WinterZoneManager {
         }
         saveState();
 
-        var cfg = plugin.getConfig();
-        int columnsPerBatch = Math.max(1, cfg.getInt("painting.columns-per-batch", 40));
-        long ticksBetween = Math.max(1, cfg.getInt("painting.ticks-between-batches", 2));
+        int columnsPerBatch = getPaintColumnsPerBatch();
+        long ticksBetween = getPaintTicksBetweenBatches();
         paintTask = Bukkit.getScheduler().runTaskTimer(plugin, () -> {
             processPaintBatch(paintQueue, columnsPerBatch);
             if (paintQueue.isEmpty()) {
@@ -639,6 +716,12 @@ public final class WinterZoneManager {
         }
         yaml.set("snow-blocks", snow);
 
+        List<String> preexisting = new ArrayList<>();
+        for (SnowPos p : preexistingSnow) {
+            preexisting.add(p.x() + "," + p.y() + "," + p.z());
+        }
+        yaml.set("preexisting-snow-blocks", preexisting);
+
         try {
             plugin.getDataFolder().mkdirs();
             yaml.save(stateFile);
@@ -663,15 +746,28 @@ public final class WinterZoneManager {
             sender.sendMessage("§cWorld '" + worldName + "' from config does not exist / is not loaded.");
             return false;
         }
-        this.world = resolved;
+        applyZoneBoundsFromConfig(resolved);
+        return true;
+    }
+
+    /**
+     * Reads center/radius/min-y/max-y from config.yml and applies them to the
+     * given (already resolved) world. Shared by start() and cleanup(), so the
+     * two never drift apart.
+     */
+    private void applyZoneBoundsFromConfig(World resolvedWorld) {
+        var cfg = plugin.getConfig();
+        this.world = resolvedWorld;
         this.centerX = cfg.getInt("zone.center-x", 0);
         this.centerZ = cfg.getInt("zone.center-z", 0);
         this.radius = Math.max(4, cfg.getInt("zone.radius", 80));
+        // -1 means "auto-detect world limits". If you ever need the zone
+        // floor/ceiling to be EXACTLY Y=-1, use a different value (e.g. -2)
+        // and adjust — -1 is reserved as the "auto" sentinel here.
         int cfgMinY = cfg.getInt("zone.min-y", -1);
         int cfgMaxY = cfg.getInt("zone.max-y", -1);
         this.minY = cfgMinY == -1 ? world.getMinHeight() : cfgMinY;
         this.maxY = cfgMaxY == -1 ? world.getMaxHeight() - 1 : cfgMaxY;
-        return true;
     }
 
     private void collectColumnsInZone(Deque<ColumnPos> out) {

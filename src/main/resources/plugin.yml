@@ -1,7 +1,7 @@
 name: CosyWinterVibes
 version: ${project.version}
 main: com.cosywintervibes.CosyWinterVibes
-api-version: '1.21'
+api-version: '26.2'
 description: Temporary reversible winter event inside a configurable base zone.
 author: IgorPilarski
 website: https://github.com/IgorPilarski/CosyWinterVibes

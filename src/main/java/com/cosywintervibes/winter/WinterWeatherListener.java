@@ -24,8 +24,6 @@ import org.bukkit.event.world.ChunkLoadEvent;
  */
 public final class WinterWeatherListener implements Listener {
 
-    private static final int ZONE_PADDING = 8;
-
     private final WinterZoneManager manager;
 
     public WinterWeatherListener(WinterZoneManager manager) {
@@ -39,7 +37,7 @@ public final class WinterWeatherListener implements Listener {
 
         // During cleanup: no new snow/ice inside the zone.
         if (manager.isCleaningUp()) {
-            if (!manager.isInsideZone(block.getLocation(), ZONE_PADDING)) return;
+            if (!manager.isInsideZone(block.getLocation(), WinterZoneManager.ZONE_PADDING)) return;
             if (formed == Material.SNOW || formed == Material.ICE || formed == Material.FROSTED_ICE) {
                 event.setCancelled(true);
             }
@@ -47,7 +45,7 @@ public final class WinterWeatherListener implements Listener {
         }
 
         if (!manager.isActive()) return;
-        if (!manager.isInsideZone(block.getLocation(), ZONE_PADDING)) return;
+        if (!manager.isInsideZone(block.getLocation(), WinterZoneManager.ZONE_PADDING)) return;
 
         if (formed == Material.ICE || formed == Material.FROSTED_ICE) {
             event.setCancelled(true);
